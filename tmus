@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+
+"""
+tmus - TMux Upteempth Sessionmanager
+License: BSD 3-Clause
+Copyright (c) 2020, Mauro <mauro@sdf.org>
+All rights reserved.
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+1. Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+__author__ = "Mauro"
+__version__ = "0.0.1"
+__license__ = "BSD3"
+
+import sys
+import json
+import shlex
+import argparse
+import subprocess as sp
+from pathlib import Path
+from os import environ as env
+
+
+SHELL = env.get("SHELL", "/bin/sh")
+TMUS_HOME = Path.home() / ".config/tmus"
+TMUS_SESSION_FILE = TMUS_HOME / "sessions.json"
+
+
+def __init__():
+    """
+    Fake init.
+    """
+    if not TMUS_SESSION_FILE.exists():
+        create_session_file()
+    start_server()
+
+
+def shell(cmd: str) -> None:
+    """
+    Base shell system call
+    """
+    cmd = shlex.split(cmd)
+    proc = sp.Popen(cmd, shell=True, stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    out, err = proc.communicate()
+    return proc.returncode
+
+
+def sh(cmd: str, get_output: bool = False) -> None:
+    """
+    Base sh call
+    """
+    cmd = shlex.split(cmd)
+    if not get_output:
+        return sp.call(cmd)
+    elif get_output:
+        return sp.check_output(cmd).decode("utf-8")
+
+
+def tmux(cmd: str, get_output: bool = False) -> None:
+    """
+    Base tmux system call
+    """
+    return sh("tmux {}".format(cmd), get_output)
+
+
+def stty_size() -> str:
+    """
+    Get current terminal window size to pass as args to tmux
+    """
+    y, x = sh("stty size", True).replace("\n", "").split(" ")
+    return f"-x{x} -y{y}"
+
+
+def start_server() -> None:
+    """
+    Start the tmux server, if not already running, without creating any sessions.
+    """
+    shell("tmux start-server &")
+
+
+def write_session_file(dct: dict = {}) -> None:
+    """
+    Creates a file that will store `tmus` sessions in JSON format.
+    """
+    with TMUS_SESSION_FILE.open("w") as _:
+        json.dump(dct, _)
+
+    return None
+
+
+def create_session_file():
+    """
+    Calls `write_session_file` but before will create the parent dir if needed.
+    """
+    TMUS_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    write_session_file()
+
+
+def read_session_file():
+    """
+    Loads `tmus` sessions in order to save/load a session.
+    """
+    contents = {}
+    with TMUS_SESSION_FILE.open("r") as _:
+        contents = json.load(_)
+
+    return contents
+
+
+def send_keys(cmd: str = "") -> None:
+    """
+    Sends a `cmd` to a tmux window and presses enter
+    """
+    tmux(f"send-keys '{cmd}' 'C-m'")
+
+
+def current_session() -> str:
+    """
+    Returns current Session name/id
+    """
+    return tmux("display-message -p '#S'", True).replace("\n", "")
+
+
+def rename_window(name: str) -> None:
+    """
+    Pretty self explanatory
+    """
+    tmux(f"rename-window '{name}'")
+
+
+def new_window(session: str, window: dict, current_command: bool = False) -> None:
+    idx = window.get("idx")
+    cmd = window.get("cmd")
+    title = window.get("title")
+    path = window.get("path")
+
+    tmux("new-window")
+    tmux(f"select-window -t {idx}")
+    send_keys(f"cd {path}")
+    if current_command:
+        send_keys(cmd)
+
+    rename_window(title)
+
+
+def list_windows(session: str = "", current_command: bool = False) -> dict:
+    """
+    Lists the windows and its contents
+    """
+    dump_format = "#S;#W;#{pane_current_path}"
+    if current_command:
+        dump_format = f"{dump_format};#{{pane_current_command}}"
+    else:
+        dump_format = f"{dump_format};{SHELL}"
+    output = tmux(f"list-windows -a -F '{dump_format}'", True)
+    output = [_ for _ in output.split("\n") if _]
+
+    if not output:
+        return {}
+
+    if not session:
+        session = current_session()
+
+    output = [_ for _ in output if _.startswith(f"{session};")]
+
+    i = 0
+    result = {}
+    for _ in output:
+        sess, title, path, cmd = _.split(";")
+        if not result.get(sess):
+            result[sess] = []
+
+        result[sess].append(dict(idx=i, title=title, path=path, cmd=cmd))
+        i += 1
+
+    return result
+
+
+def ls(verbose: bool = False) -> dict:
+    """
+    List the current sessions, or the windows within a session
+    """
+    stored_sessions = read_session_file().copy()
+    if verbose:
+        return stored_sessions
+    else:
+        return {k: f"{len(v)} windows" for k,v in stored_sessions.items()}
+
+
+def save(session: str = "", current_command: bool = False) -> None:
+    """
+    Save sessions. By default the current one, but n save all active too
+    """
+    if not session:
+        print("[ERR] Missing session name!")
+        sys.exit(1)
+
+    curr_session = current_session()
+    output = list_windows(curr_session, current_command)
+    output = output[curr_session]
+
+    stored_sessions = read_session_file().copy()
+    stored_sessions.update({session: output})
+    write_session_file(stored_sessions)
+
+
+def load(session: str = "", current_command: bool = False) -> None:
+    """
+    Loads a session. Session name needs to be explicit
+    """
+    if not session:
+        print("[ERR] Missing session name!")
+        sys.exit(1)
+
+    stored_sessions = read_session_file().copy()
+    if session in list(stored_sessions.keys()):
+        active = stored_sessions.get(session)
+        for window in active:
+            new_window(session, window, current_command)
+    else:
+        print(f"[ERR] No session found named `{session}`!")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "cmd",
+        type=str,
+        nargs="?",
+        help="""
+    Which command to run:
+    `ls`, lists sessions / windows;
+    `load`, loads a single session at a time (requires a session name);
+    `save`, saves a single session at a time (requires a session name);
+""",
+    )
+    parser.add_argument(
+        "-t",
+        "--target-session",
+        type=str,
+        required=False,
+        default="",
+        help="Session name",
+    )
+    parser.add_argument(
+        "-c",
+        "--current-command",
+        action="store_true",
+        help="Read current command for each (session) window. Pretty useless, tbh.",
+    )
+    parser.add_argument(
+        "-V", "--verbose", action="store_true", help="Show stdout messages"
+    )
+    args = parser.parse_args()
+    __init__()
+
+    if args.cmd in ["ls", "save", "load", "rename"]:
+        if "ls" == args.cmd:
+            output = ls(args.verbose)
+            print(json.dumps(output))
+        elif "save" == args.cmd:
+            save(args.target_session, args.current_command)
+        elif "load" == args.cmd:
+            load(args.target_session, args.current_command)
+    else:
+        parser.print_help()
